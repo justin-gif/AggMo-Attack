@@ -1,0 +1,172 @@
+class AggMoIterativeAttack(Attack, LabelMixin):
+    """
+    聚合动量迭代攻击 (AggMo-based Iterative Attack)
+    基于AggMo思想改进动量迭代攻击，通过多个动量向量的平均来提升稳定性和收敛速度
+    
+    
+    :param predict: 前向传播函数
+    :param loss_fn: 损失函数
+    :param eps: 最大扰动幅度
+    :param nb_iter: 迭代次数
+    :param decay_factors: 衰减系数列表，默认为[0.0, 0.9, 0.99] (AggMo默认设置)
+    :param eps_iter: 每次迭代的攻击步长
+    :param clip_min: 输入维度的最小值
+    :param clip_max: 输入维度的最大值
+    :param targeted: 是否为定向攻击
+    :param ord: 扰动范数类型 (inf 或 2)
+    """
+
+    def __init__(
+            self, predict, loss_fn=None, eps=0.3, nb_iter=40, decay_factors=[0.0, 0.9, 0.99],
+            eps_iter=0.01, clip_min=0., clip_max=1., targeted=False,
+            ord=np.inf):
+        """创建聚合动量迭代攻击实例"""
+        super(AggMoIterativeAttack, self).__init__(
+            predict, loss_fn, clip_min, clip_max)
+        self.eps = eps
+        self.nb_iter = nb_iter
+        self.decay_factors = decay_factors
+        self.num_momentums = len(decay_factors)  # 动量向量数量
+        self.eps_iter = eps_iter
+        self.targeted = targeted
+        self.ord = ord
+        if self.loss_fn is None:
+            self.loss_fn = nn.CrossEntropyLoss(reduction="sum")
+
+    def perturb(self, x, y=None):
+        """
+        给定样本(x, y)，返回其对抗样本，扰动幅度不超过eps
+        
+        :param x: 输入张量
+        :param y: 标签张量
+                  - 如果为None且self.targeted=False，则计算预测标签作为y
+                  - 如果self.targeted=True，则y必须为目标标签
+        :return: 包含对抗样本的张量
+        """
+        x, y = self._verify_and_process_inputs(x, y)
+
+        delta = torch.zeros_like(x)
+        # 初始化多个动量向量，每个对应一个衰减系数
+        momentum_vectors = [torch.zeros_like(x) for _ in range(self.num_momentums)]
+
+        delta = nn.Parameter(delta)
+
+        for i in range(self.nb_iter):
+            # 清空梯度
+            if delta.grad is not None:
+                delta.grad.detach_()
+                delta.grad.zero_()
+
+            # 前向传播计算损失
+            imgadv = x + delta
+            outputs = self.predict(imgadv)
+            outputs = outputs.squeeze(0)
+            loss = self.loss_fn(outputs, y)
+            if self.targeted:
+                loss = -loss
+            loss.backward()
+
+            # 计算归一化的梯度
+            normalized_grad = normalize_by_pnorm(delta.grad.data, p=1)
+            
+            # 更新每个动量向量 (AggMo核心)
+            for j in range(self.num_momentums):
+                momentum_vectors[j] = self.decay_factors[j] * momentum_vectors[j] + normalized_grad
+            
+            # 计算聚合动量 (取平均)
+            aggregated_momentum = torch.zeros_like(x)
+            for j in range(self.num_momentums):
+                aggregated_momentum += momentum_vectors[j]
+            aggregated_momentum = aggregated_momentum / self.num_momentums
+            
+            # 可选：对聚合动量进行归一化
+            # aggregated_momentum = normalize_by_pnorm(aggregated_momentum, p=1)
+            
+            # 根据范数类型更新扰动
+            if self.ord == np.inf:
+                delta.data += batch_multiply(self.eps_iter, torch.sign(aggregated_momentum))
+                delta.data = batch_clamp(self.eps, delta.data)
+                delta.data = clamp(
+                    x + delta.data, min=self.clip_min, max=self.clip_max) - x
+            elif self.ord == 2:
+                delta.data += self.eps_iter * normalize_by_pnorm(aggregated_momentum, p=2)
+                delta.data *= clamp(
+                    (self.eps * normalize_by_pnorm(delta.data, p=2) /
+                        delta.data),
+                    max=1.)
+                delta.data = clamp(
+                    x + delta.data, min=self.clip_min, max=self.clip_max) - x
+            else:
+                error = "Only ord = inf and ord = 2 have been implemented"
+                raise NotImplementedError(error)
+
+        rval = x + delta.data
+        return rval
+
+
+
+class AggMoIterativeAttack_l2(Attack, LabelMixin):
+    def __init__(
+            self, predict, loss_fn=None, eps=0.3, nb_iter=40, decay_factors=[0.0, 0.9, 0.99],
+            eps_iter=0.01, clip_min=0., clip_max=1., targeted=False):
+        super(AggMoIterativeAttack_l2, self).__init__(
+            predict, loss_fn, clip_min, clip_max)
+        
+        self.eps = eps
+        self.nb_iter = nb_iter
+        self.decay_factors = decay_factors
+        self.num_momentums = len(decay_factors)
+        self.eps_iter = eps_iter
+        self.targeted = targeted
+
+        if self.loss_fn is None:
+            self.loss_fn = nn.CrossEntropyLoss(reduction="sum")
+
+    def perturb(self, x, y=None):
+        x, y = self._verify_and_process_inputs(x, y)
+
+        delta = torch.zeros_like(x)
+        momentum_vectors = [torch.zeros_like(x) for _ in range(self.num_momentums)]
+        delta = nn.Parameter(delta)
+
+        for i in range(self.nb_iter):
+            if delta.grad is not None:
+                delta.grad.detach_()
+                delta.grad.zero_()
+
+            imgadv = x + delta
+            outputs = self.predict(imgadv)
+          # ==================== 修复标签形状 ====================
+            if len(outputs.shape) == 1:
+                outputs = outputs.unsqueeze(0)
+            if len(y.shape) == 2:
+                y = y.squeeze(0)
+            if y.numel() == outputs.size(1):
+                y = torch.argmax(y).unsqueeze(0)
+
+            loss = self.loss_fn(outputs, y)
+            if self.targeted:
+                loss = -loss
+            loss.backward()
+
+            normalized_grad = normalize_by_pnorm(delta.grad.data, p=1)
+
+            for j in range(self.num_momentums):
+                momentum_vectors[j] = self.decay_factors[j] * momentum_vectors[j] + normalized_grad
+
+            aggregated_momentum = torch.zeros_like(x)
+            for j in range(self.num_momentums):
+                aggregated_momentum += momentum_vectors[j]
+            aggregated_momentum = aggregated_momentum / self.num_momentums
+
+            delta.data += self.eps_iter * normalize_by_pnorm(aggregated_momentum, p=2)
+
+            # L2 约束
+            norm = torch.norm(delta.data)
+            if norm > self.eps:
+                delta.data *= self.eps / norm
+
+            delta.data = clamp(x + delta.data, self.clip_min, self.clip_max) - x
+
+        rval = x + delta.data
+        return rval
